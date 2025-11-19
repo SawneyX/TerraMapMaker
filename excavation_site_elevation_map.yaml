@@ -1,0 +1,25 @@
+map_name: excavation_site
+layer: elevation
+frame_id: map
+timestamp:
+  sec: 2251
+  nanosec: 839949667
+resolution: 0.1
+length:
+  x: 120.0
+  y: 120.0
+size_cells:
+  rows: 1200
+  cols: 1200
+position:
+  x: 0.0
+  y: 0.0
+  z: 0.0
+orientation:
+  x: 0.0
+  y: 0.0
+  z: 0.0
+  w: 1.0
+outer_start_index: 0
+inner_start_index: 0
+data_file: src/moleworks_ros/high_level_controllers/nav2/mole_nav2_bringup/maps/excavation_site/excavation_site_elevation_map.npy

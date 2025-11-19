@@ -1,0 +1,14 @@
+# TerraMapMaker Georeference Configuration
+# GNSS reference point for converting between GPS (WGS84) and local ENU coordinates
+
+gnss:
+  useGnssReference: true
+  referenceLatitude: 47.4084860363   # ETH Hönggerberg (Hoengg)
+  referenceLongitude: 8.50435818058
+  referenceAltitude: 565.0
+  referenceHeading: 0.0  # radians
+
+  # Alternative locations:
+  # Wangen a.A.: lat=47.234593265310046, lon=7.681415329904487, alt=472.584, heading=0.0
+  # Oberglatt: lat=47.4801402, lon=8.49975325, alt=474.9, heading=2.6305
+

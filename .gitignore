@@ -1,0 +1,33 @@
+# ROS bag files
+*.bag
+*.mcap
+*.db3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.npy
+previews/
+layer_previews/
+tools/
+
