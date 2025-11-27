@@ -2,7 +2,7 @@
 # GNSS reference point for converting between GPS (WGS84) and local ENU coordinates
 
 gnss:
-  useGnssReference: true
+  useGnssReference: false
   referenceLatitude: 47.4084860363   # ETH Hönggerberg (Hoengg)
   referenceLongitude: 8.50435818058
   referenceAltitude: 565.0

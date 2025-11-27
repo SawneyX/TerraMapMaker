@@ -119,6 +119,7 @@ class GridScene(QGraphicsScene):
         self.obstacle_mask = np.zeros((grid_size, grid_size), dtype=np.uint8)
         self.nodump_mask = np.zeros((grid_size, grid_size), dtype=np.uint8)
         self.background_item: Optional[QGraphicsPixmapItem] = None
+        self.transpose_background: bool = True  # swap axes for georef-aligned maps by default
         # Overlay image (satellite) support
         self.overlay_item: Optional[QGraphicsPixmapItem] = None
         self.overlay_scale: float = 1.0
@@ -186,9 +187,10 @@ class GridScene(QGraphicsScene):
                 pad_h = self.grid_size - arr.shape[0]
                 pad_w = self.grid_size - arr.shape[1]
                 arr = np.pad(arr, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=arr.min())
-        # Transpose to fix diagonal mirroring: swap rows and columns
+        # Optionally transpose to fix diagonal mirroring when GNSS alignment is active
         arr_original = arr.copy()  # Keep original for debug
-        arr = arr.T
+        should_transpose = getattr(self, "transpose_background", True)
+        arr = arr.T if should_transpose else arr.copy()
         qimg = numpy_to_qimage_grayscale(arr)
         # Debug: verify first pixel matches first array element
         if qimg.width() > 0 and qimg.height() > 0:
@@ -660,11 +662,21 @@ class GridScene(QGraphicsScene):
         cells_to_clear = old_cell_set - new_cell_set
         
         # Clear old cells that are not in new positions
+        # Restore terrain elevation for cleared cells
         for x, y in cells_to_clear:
             if 0 <= y < self.grid_size and 0 <= x < self.grid_size:
                 self.foundation_mask[y, x] = 0
                 if self.foundation_depth_map is not None:
                     self.foundation_depth_map[y, x] = 0
+                # Restore original elevation when foundation is removed
+                if self.foundation_original_elevation is not None and callable(self.get_elevation):
+                    try:
+                        elev = self.get_elevation()
+                        if elev is not None and elev.shape == self.foundation_original_elevation.shape:
+                            # Restore original elevation for this cell
+                            elev[y, x] = self.foundation_original_elevation[y, x]
+                    except:
+                        pass
                 self._update_cell_brush(x, y)
         
         # Update group
@@ -1254,6 +1266,19 @@ class GridScene(QGraphicsScene):
     def mouseReleaseEvent(self, event) -> None:
         # End foundation group dragging
         if self._dragged_group is not None:
+            # Restore terrain elevation for any cells that were cleared during the move
+            # This ensures old foundation areas have their terrain restored
+            if callable(self.get_elevation) and self.foundation_original_elevation is not None:
+                try:
+                    elev = self.get_elevation()
+                    if elev is not None and elev.shape == self.foundation_original_elevation.shape:
+                        # Restore elevation for all non-foundation cells
+                        for y in range(self.grid_size):
+                            for x in range(self.grid_size):
+                                if self.foundation_mask[y, x] == 0:
+                                    elev[y, x] = self.foundation_original_elevation[y, x]
+                except:
+                    pass
             # Update 3D view only once after dragging is complete
             if self.on_mask_changed:
                 self.on_mask_changed()
@@ -1458,6 +1483,7 @@ class MainWindow(QMainWindow):
         self.scene = GridScene(self.grid_size)
         self.scene.meters_per_tile = self.meters_per_tile
         self.scene.on_background_moved = self._on_background_dragged
+        self._configure_gnss_usage(True)
         # Tile offsets for PCL placement (drag background to adjust)
         self.offset_x: int = 0
         self.offset_y: int = 0
@@ -1468,6 +1494,14 @@ class MainWindow(QMainWindow):
         self.original_desired_elevation_array: Optional[np.ndarray] = None  # Original desired_elevation before resizing
         self.previous_desired_elevation_canvas: Optional[np.ndarray] = None  # Previous desired_elevation from loaded bag (before overwriting)
         self.original_previous_desired_elevation_array: Optional[np.ndarray] = None  # Original previous desired_elevation before resizing
+        self.rotation_deg: float = 0.0
+        # Unrotated base arrays (used to reapply rotation)
+        self._base_canvas: Optional[np.ndarray] = None
+        self._base_desired_canvas: Optional[np.ndarray] = None
+        self._base_previous_desired_canvas: Optional[np.ndarray] = None
+        self._base_original_elevation_array: Optional[np.ndarray] = None
+        self._base_original_desired_array: Optional[np.ndarray] = None
+        self._base_original_previous_desired_array: Optional[np.ndarray] = None
         # Store original bag file info for exporting
         self.original_bag_path: Optional[str] = None
         self.original_gridmap_msg = None
@@ -1622,7 +1656,6 @@ class MainWindow(QMainWindow):
         self.btn_load_foundation = QPushButton("Import Foundation")
         self.btn_export = QPushButton("Export")
         self.btn_export.setObjectName("exportBtn")
-        self.btn_dummy_pcl = QPushButton("Dummy PCL")
 
         # Resolution for loaded elevation maps (meters per cell), does not change global meters_per_tile
         self.map_res_spin = QDoubleSpinBox()
@@ -1640,6 +1673,12 @@ class MainWindow(QMainWindow):
         self.offset_y_spin.setRange(-10000, 10000)
         self.offset_y_spin.setValue(0)
         self.offset_y_spin.valueChanged.connect(self.on_offset_manual_change)
+        self.rotation_spin = QDoubleSpinBox()
+        self.rotation_spin.setRange(-180.0, 180.0)
+        self.rotation_spin.setDecimals(1)
+        self.rotation_spin.setSingleStep(1.0)
+        self.rotation_spin.setValue(self.rotation_deg)
+        self.rotation_spin.valueChanged.connect(self.on_rotation_changed)
 
         self.grid_size_combo = QComboBox()
         self.grid_size_combo.addItems(["32", "64", "128", "256"])
@@ -1662,7 +1701,6 @@ class MainWindow(QMainWindow):
         self.btn_load_geo.clicked.connect(self.on_load_geo_map)
         self.btn_load_foundation.clicked.connect(self.on_load_foundation)
         self.btn_export.clicked.connect(self.on_export)
-        self.btn_dummy_pcl.clicked.connect(self.on_dummy_pcl)
         self.placement_combo.currentTextChanged.connect(self.on_placement_changed)
 
         # Connect rectangle callback
@@ -1780,10 +1818,16 @@ class MainWindow(QMainWindow):
         scale_row.addWidget(self.height_scale_spin)
         side_layout.addLayout(scale_row)
 
+        row = QHBoxLayout()
         self.lbl_min = QLabel("Min dig: -")
         self.lbl_max = QLabel("Max dig: -")
-        side_layout.addWidget(self.lbl_min)
-        side_layout.addWidget(self.lbl_max)
+        row.addWidget(self.lbl_min)
+        row.addWidget(self.lbl_max)
+        self.btn_flatten_max = QPushButton("Flatten to max")
+        self.btn_flatten_max.setToolTip("Set the selected foundation floor to the deepest dig depth.")
+        self.btn_flatten_max.clicked.connect(self.flatten_dig_plane)
+        row.addWidget(self.btn_flatten_max)
+        side_layout.addLayout(row)
 
 
         self.tabs = QTabWidget()
@@ -1887,22 +1931,27 @@ class MainWindow(QMainWindow):
     def on_tool_cell(self) -> None:
         self.scene.tool_mode = "cell"
         self.scene._clear_polygon()
+        self.scene._select_foundation_group(None)
 
     def on_tool_rect(self) -> None:
         self.scene.tool_mode = "rect"
         self.scene._clear_polygon()
+        self.scene._select_foundation_group(None)
 
     def on_tool_polygon(self) -> None:
         self.scene.tool_mode = "polygon"
+        self.scene._select_foundation_group(None)
 
     def on_tool_select(self) -> None:
         self.scene.tool_mode = "select"
         self.scene._clear_polygon()
         self.scene._clear_ruler()
+        # Don't deselect on select tool - allow selection to remain
 
     def on_tool_ruler(self) -> None:
         self.scene.tool_mode = "ruler"
         self.scene._clear_polygon()
+        self.scene._select_foundation_group(None)
 
     def on_type_change(self, type_key: str) -> None:
         self.scene.current_type = type_key
@@ -2286,9 +2335,16 @@ class MainWindow(QMainWindow):
                 img_resized = img.resize((out_w, out_h), Image.BILINEAR)
                 resized = np.array(img_resized, dtype=np.float32) / 255.0
                 resized = resized * (a_max - a_min) + a_min
-            # Store as canvas and use placement system to display on grid
-            self.last_pcl_canvas = resized
-            self._set_default_offsets(resized.shape)
+            # Store as canvas (unrotated) and use placement system to display on grid
+            self._store_base_canvas(resized, apply_rotation=False)
+            self._store_base_desired_canvas(None, apply_rotation=False)
+            self._store_base_previous_desired_canvas(None, apply_rotation=False)
+            self._store_base_original_elevation_array(resized.copy(), apply_rotation=False)
+            self._store_base_original_desired_array(None, apply_rotation=False)
+            self._store_base_original_previous_desired_array(None, apply_rotation=False)
+            self._apply_rotation_to_bases()
+            canvas_shape = self.last_pcl_canvas.shape if self.last_pcl_canvas is not None else resized.shape
+            self._set_default_offsets(canvas_shape)
             # Clear placement params (will be set when placement is applied)
             self.placement_params = None
             if hasattr(self, 'placement_combo'):
@@ -2475,6 +2531,7 @@ class MainWindow(QMainWindow):
                     if config and 'gnss' in config:
                         # Store full config (keep 'gnss' nesting)
                         self.georef_config = config
+                        self._configure_gnss_usage(config.get('gnss', {}).get('useGnssReference', False))
                         
                         if is_georeferenced and config.get('gnss', {}).get('useGnssReference', False):
                             use_geo_ref = True
@@ -2608,6 +2665,9 @@ class MainWindow(QMainWindow):
                 print(f"  → Mesh has uniform depth: Z = {z_min:.2f}m")
                 print(f"  → Will use uniform depth from depth spinbox")
             
+            # Store absolute Z values for all imported cells (for recalculation when base height changes)
+            all_cell_absolute_z = {}  # Dict: (cx, cy) -> average absolute Z
+            
             # If we have faces, use them for better coverage
             if faces is not None and len(faces) > 0:
                 # Rasterize faces to grid cells with depth information
@@ -2661,29 +2721,36 @@ class MainWindow(QMainWindow):
                                     cells_to_fill[cell_key].append(z_interp)
                 
                 # Batch update foundation mask and depth map
-                # For imported foundations, convert absolute Z to relative depth (below surface)
+                # For imported foundations, use a common base height (max elevation in foundation area) for all tiles
+                for (cx, cy), z_values in cells_to_fill.items():
+                    if 0 <= cy < self.grid_size and 0 <= cx < self.grid_size:
+                        self.scene.foundation_mask[cy, cx] = 1
+                        # Average Z values if multiple faces contribute to this cell
+                        avg_bottom_z = np.mean(z_values)
+                        # Store absolute Z for this cell (for recalculation when base height changes)
+                        all_cell_absolute_z[(cx, cy)] = avg_bottom_z
+                
+                # Calculate common base height: max elevation in foundation area
+                common_base_height = 0.0
                 if self.last_placed_elevation is not None:
-                    for (cx, cy), z_values in cells_to_fill.items():
+                    elev_values = []
+                    for (cx, cy) in all_cell_absolute_z.keys():
                         if 0 <= cy < self.grid_size and 0 <= cx < self.grid_size:
-                            self.scene.foundation_mask[cy, cx] = 1
-                            # Average Z values if multiple faces contribute to this cell
-                            avg_bottom_z = np.mean(z_values)
-                            # Convert to relative depth: surface elevation - bottom Z
-                            surface_z = self.last_placed_elevation[cy, cx]
-                            relative_depth = surface_z - avg_bottom_z
-                            # Store as relative depth (negative means below surface)
-                            if self.scene.foundation_depth_map is None:
-                                self.scene.foundation_depth_map = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-                            self.scene.foundation_depth_map[cy, cx] = max(0.0, relative_depth)
-                else:
-                    # No elevation data, store absolute Z (will be converted later)
-                    for (cx, cy), z_values in cells_to_fill.items():
-                        if 0 <= cy < self.grid_size and 0 <= cx < self.grid_size:
-                            self.scene.foundation_mask[cy, cx] = 1
-                            avg_z = np.mean(z_values)
-                            if self.scene.foundation_depth_map is None:
-                                self.scene.foundation_depth_map = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-                            self.scene.foundation_depth_map[cy, cx] = avg_z
+                            elev_val = self.last_placed_elevation[cy, cx]
+                            if np.isfinite(elev_val):
+                                elev_values.append(float(elev_val))
+                    if elev_values:
+                        common_base_height = max(elev_values)
+                
+                # Convert to relative depth using common base height for all tiles
+                for (cx, cy), avg_bottom_z in all_cell_absolute_z.items():
+                    if 0 <= cy < self.grid_size and 0 <= cx < self.grid_size:
+                        # Convert to relative depth: common base height - bottom Z (same base for all tiles)
+                        relative_depth = common_base_height - avg_bottom_z
+                        # Store as relative depth (positive means below base height)
+                        if self.scene.foundation_depth_map is None:
+                            self.scene.foundation_depth_map = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+                        self.scene.foundation_depth_map[cy, cx] = max(0.0, relative_depth)
             else:
                 # No faces available, use point cloud approach
                 # Mark cells that contain vertices and store Z values
@@ -2697,23 +2764,33 @@ class MainWindow(QMainWindow):
                             cell_z_map[cell_key] = []
                         cell_z_map[cell_key].append(vertices_local[i, 2])
                 
-                # Store average Z per cell, convert to relative depth if elevation data available
+                # Store average Z per cell, use common base height for all tiles
+                for (cx, cy), z_values in cell_z_map.items():
+                    if 0 <= cy < self.grid_size and 0 <= cx < self.grid_size:
+                        avg_bottom_z = np.mean(z_values)
+                        # Store absolute Z for this cell (for recalculation when base height changes)
+                        all_cell_absolute_z[(cx, cy)] = avg_bottom_z
+                
+                # Calculate common base height: max elevation in foundation area
+                common_base_height = 0.0
                 if self.last_placed_elevation is not None:
-                    for (cx, cy), z_values in cell_z_map.items():
+                    elev_values = []
+                    for (cx, cy) in all_cell_absolute_z.keys():
                         if 0 <= cy < self.grid_size and 0 <= cx < self.grid_size:
-                            avg_bottom_z = np.mean(z_values)
-                            surface_z = self.last_placed_elevation[cy, cx]
-                            relative_depth = surface_z - avg_bottom_z
-                            if self.scene.foundation_depth_map is None:
-                                self.scene.foundation_depth_map = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-                            self.scene.foundation_depth_map[cy, cx] = max(0.0, relative_depth)
-                else:
-                    # No elevation data, store absolute Z
-                    for (cx, cy), z_values in cell_z_map.items():
-                        if 0 <= cy < self.grid_size and 0 <= cx < self.grid_size:
-                            if self.scene.foundation_depth_map is None:
-                                self.scene.foundation_depth_map = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-                            self.scene.foundation_depth_map[cy, cx] = np.mean(z_values)
+                            elev_val = self.last_placed_elevation[cy, cx]
+                            if np.isfinite(elev_val):
+                                elev_values.append(float(elev_val))
+                    if elev_values:
+                        common_base_height = max(elev_values)
+                
+                # Convert to relative depth using common base height for all tiles
+                for (cx, cy), avg_bottom_z in all_cell_absolute_z.items():
+                    if 0 <= cy < self.grid_size and 0 <= cx < self.grid_size:
+                        # Convert to relative depth: common base height - bottom Z (same base for all tiles)
+                        relative_depth = common_base_height - avg_bottom_z
+                        if self.scene.foundation_depth_map is None:
+                            self.scene.foundation_depth_map = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+                        self.scene.foundation_depth_map[cy, cx] = max(0.0, relative_depth)
                 
                 # Fill convex hull of points
                 try:
@@ -2762,15 +2839,42 @@ class MainWindow(QMainWindow):
                             # Store as relative depth (already converted during import)
                             group_depth_map[(x, y)] = depth_val
                 
+                # Store absolute Z values for recalculation when base height changes
+                group_absolute_z = {}
+                for x, y in foundation_cells:
+                    if (x, y) in all_cell_absolute_z:
+                        group_absolute_z[(x, y)] = all_cell_absolute_z[(x, y)]
+                
+                # Calculate common base height: max elevation in foundation area
+                common_base_height = 0.0
+                if self.last_placed_elevation is not None:
+                    elev_values = []
+                    for x, y in foundation_cells:
+                        if 0 <= y < self.scene.grid_size and 0 <= x < self.scene.grid_size:
+                            elev_val = self.last_placed_elevation[y, x]
+                            if np.isfinite(elev_val):
+                                elev_values.append(float(elev_val))
+                    if elev_values:
+                        common_base_height = max(elev_values)
+                
                 # Create group object
                 group = {
                     'cells': foundation_cells,
                     'outline': outline_polygon,
                     'outline_item': None,  # Will be created
                     'depth_map': group_depth_map,
+                    'absolute_z': group_absolute_z,  # Store absolute Z for recalculation
                     'id': len(self.scene.foundation_groups),  # Unique ID
                     'is_imported': True  # Mark as imported
                 }
+                
+                # Set group depth to common base height (max elevation in foundation area)
+                if hasattr(self, 'group_depth_spin') and common_base_height > 0:
+                    self.group_depth_spin.blockSignals(True)
+                    self.group_depth_spin.setValue(common_base_height)
+                    self.group_depth_spin.blockSignals(False)
+                    # Select the group so the depth box is visible
+                    self.scene._select_foundation_group(group)
                 
                 # Add outline to scene
                 group['outline_item'] = self.scene._draw_group_outline(group)
@@ -2883,7 +2987,8 @@ class MainWindow(QMainWindow):
             if not config or 'gnss' not in config:
                 raise ValueError("Config file missing 'gnss' section")
             
-            if not config.get('gnss', {}).get('useGnssReference', False):
+            use_gnss_ref = bool(config.get('gnss', {}).get('useGnssReference', False))
+            if not use_gnss_ref:
                 QMessageBox.warning(
                     self,
                     "Config Warning",
@@ -2897,6 +3002,7 @@ class MainWindow(QMainWindow):
             
             # Store full config (keep 'gnss' nesting)
             self.georef_config = config
+            self._configure_gnss_usage(use_gnss_ref)
             
             # Handle .npy files directly
             if file_ext == '.npy':
@@ -2913,8 +3019,10 @@ class MainWindow(QMainWindow):
                 self.original_gridmap_resolution = resolution
                 self.original_gridmap_conn_info = None  # No connection info for npy files
                 # Clear desired_elevation (npy files don't have it)
-                self.desired_elevation_canvas = None
-                self.original_desired_elevation_array = None
+                self._store_base_desired_canvas(None, apply_rotation=False)
+                self._store_base_previous_desired_canvas(None, apply_rotation=False)
+                self._store_base_original_desired_array(None, apply_rotation=False)
+                self._store_base_original_previous_desired_array(None, apply_rotation=False)
                 # Disable checkbox for npy files
                 if hasattr(self, 'chk_show_desired_elevation'):
                     self.chk_show_desired_elevation.setEnabled(False)
@@ -2954,10 +3062,12 @@ class MainWindow(QMainWindow):
                     resized = np.array(img_resized, dtype=np.float32) / 255.0
                     resized = resized * (a_max - a_min) + a_min
             
-                # Store as canvas
-                self.last_pcl_canvas = resized
-                self.offset_x = 0
-                self.offset_y = 0
+                # Store as canvas/original bases
+                self._store_base_original_elevation_array(elev_array.copy(), apply_rotation=False)
+                self._store_base_canvas(resized, apply_rotation=False)
+                self._apply_rotation_to_bases()
+                canvas_shape = self.last_pcl_canvas.shape if self.last_pcl_canvas is not None else resized.shape
+                self._set_default_offsets(canvas_shape)
                 # Clear placement params (will be set when placement is applied)
                 self.placement_params = None
                 
@@ -2966,15 +3076,6 @@ class MainWindow(QMainWindow):
                     self.map_res_spin.blockSignals(True)
                     self.map_res_spin.setValue(resolution)
                     self.map_res_spin.blockSignals(False)
-                
-                if hasattr(self, 'offset_x_spin'):
-                    self.offset_x_spin.blockSignals(True)
-                    self.offset_x_spin.setValue(0)
-                    self.offset_x_spin.blockSignals(False)
-                if hasattr(self, 'offset_y_spin'):
-                    self.offset_y_spin.blockSignals(True)
-                    self.offset_y_spin.setValue(0)
-                    self.offset_y_spin.blockSignals(False)
                 
                 if hasattr(self, 'placement_combo'):
                     self.placement_combo.blockSignals(True)
@@ -3384,12 +3485,12 @@ class MainWindow(QMainWindow):
                     resized = resized * (a_max - a_min) + a_min
                 
                 # Store original elevation array (before resizing) for export
-                self.original_elevation_array = elev_array.copy()
+                self._store_base_original_elevation_array(elev_array.copy(), apply_rotation=False)
                 
                 # Store and resize previous_desired_elevation if it exists (from loaded bag)
                 if previous_desired_elev_array is not None and previous_desired_elev_array.shape == elev_array.shape:
                     # Store original previous_desired_elevation array (before resizing)
-                    self.original_previous_desired_elevation_array = previous_desired_elev_array.copy()
+                    self._store_base_original_previous_desired_array(previous_desired_elev_array.copy(), apply_rotation=False)
                     
                     # Resize previous_desired_elevation using its own min/max (not elevation's)
                     # desired_elevation has different values (lower in foundation areas), so needs its own normalization
@@ -3407,16 +3508,16 @@ class MainWindow(QMainWindow):
                         prev_resized = np.array(prev_img_resized, dtype=np.float32) / 255.0
                         prev_resized = prev_resized * (prev_max - prev_min) + prev_min
                     
-                    self.previous_desired_elevation_canvas = prev_resized
+                    self._store_base_previous_desired_canvas(prev_resized, apply_rotation=False)
                 else:
                     # No previous desired_elevation - clear it
-                    self.previous_desired_elevation_canvas = None
-                    self.original_previous_desired_elevation_array = None
+                    self._store_base_previous_desired_canvas(None, apply_rotation=False)
+                    self._store_base_original_previous_desired_array(None, apply_rotation=False)
                 
                 # Resize and store desired_elevation (always exists now, as copy of elevation)
                 if desired_elev_array is not None and desired_elev_array.shape == elev_array.shape:
                     # Store original desired_elevation array (before resizing) for export
-                    self.original_desired_elevation_array = desired_elev_array.copy()
+                    self._store_base_original_desired_array(desired_elev_array.copy(), apply_rotation=False)
                     
                     # Resize desired_elevation the same way as elevation
                     desired_arr_filled = np.where(np.isfinite(desired_elev_array), desired_elev_array, a_min).astype(np.float32)
@@ -3431,12 +3532,16 @@ class MainWindow(QMainWindow):
                         desired_resized = np.array(desired_img_resized, dtype=np.float32) / 255.0
                         desired_resized = desired_resized * (a_max - a_min) + a_min
                     
-                    self.desired_elevation_canvas = desired_resized
+                    self._store_base_desired_canvas(desired_resized, apply_rotation=False)
                 else:
                     # This shouldn't happen since we always set desired_elev_array = elev_array.copy()
-                    self.desired_elevation_canvas = None
-                    self.original_desired_elevation_array = None
+                    self._store_base_desired_canvas(None, apply_rotation=False)
+                    self._store_base_original_desired_array(None, apply_rotation=False)
                 
+                # Store resized canvas (unrotated) and apply current rotation
+                self._store_base_canvas(resized, apply_rotation=False)
+                self._apply_rotation_to_bases()
+
                 # Update checkbox state and label based on availability
                 # Enable if we have either desired_elevation or previous_desired_elevation
                 if hasattr(self, 'chk_show_desired_elevation'):
@@ -3453,8 +3558,8 @@ class MainWindow(QMainWindow):
                             self.chk_show_desired_elevation.setText("Show desired elevation")
                 
                 # Store as canvas (same as regular map loading)
-            self.last_pcl_canvas = resized
-            self._set_default_offsets(resized.shape)
+            canvas_shape = self.last_pcl_canvas.shape if self.last_pcl_canvas is not None else resized.shape
+            self._set_default_offsets(canvas_shape)
             # Clear placement params (will be set when placement is applied)
             self.placement_params = None
                 
@@ -3509,38 +3614,14 @@ class MainWindow(QMainWindow):
         try:
             pts = load_pointcloud(path)
             canvas, _ = rasterize_pointcloud(pts, self.meters_per_tile)
-            self.last_pcl_canvas = canvas
-            self._set_default_offsets(canvas.shape)
+            self._store_base_canvas(canvas, apply_rotation=False)
+            self._apply_rotation_to_bases()
+            canvas_shape = self.last_pcl_canvas.shape if self.last_pcl_canvas is not None else canvas.shape
+            self._set_default_offsets(canvas_shape)
             self._update_offset_ranges()
             self._apply_current_placement()
         except Exception as exc:
             QMessageBox.critical(self, "PCL Load Error", f"Failed to load point cloud:\n{exc}")
-
-    def on_dummy_pcl(self) -> None:
-        tiles = 100
-        step = self.meters_per_tile
-        xs = np.arange(0, tiles) * step
-        ys = np.arange(0, tiles) * step
-        X, Y = np.meshgrid(xs, ys)
-        slope = 0.002 * (X - X.mean()) + 0.0015 * (Y - Y.mean())
-        terrain = (
-            0.8 * np.sin(X * 0.15) * np.cos(Y * 0.11) +
-            0.4 * np.sin(X * 0.05 + 1.3) * np.sin(Y * 0.07 + 0.7) +
-            0.2 * np.cos(X * 0.21 - 0.4) * np.cos(Y * 0.17 + 0.2)
-        )
-        cx, cy = xs.mean(), ys.mean()
-        R = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
-        hill = 1.2 * np.exp(-(R / (tiles * step * 0.45)) ** 2)
-        Z = 0.8 * terrain + hill + slope
-        zmin, zmax = float(Z.min()), float(Z.max())
-        if zmax - zmin > 1e-6:
-            Z = 2.0 * (Z - zmin) / (zmax - zmin)
-        pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1).astype(np.float32)
-        canvas, _ = rasterize_pointcloud(pts, self.meters_per_tile)
-        self.last_pcl_canvas = canvas
-        self._set_default_offsets(canvas.shape)
-        self._update_offset_ranges()
-        self._apply_current_placement()
 
     # ----- Placement application -----
     def _apply_current_placement(self) -> None:
@@ -3653,6 +3734,14 @@ class MainWindow(QMainWindow):
             self.offset_y_spin.setValue(self.offset_y)
             self.offset_y_spin.blockSignals(False)
 
+    def on_rotation_changed(self, value: float) -> None:
+        """Handle rotation adjustments (degrees)."""
+        self.rotation_deg = float(value)
+        self._apply_rotation_to_bases()
+        self._apply_current_placement()
+        self.update_foundation_profile()
+        self.update_3d_view()
+
     def _draw_map_center_marker(self, grid_col: int, grid_row: int) -> None:
         # Remove existing marker items if any
         try:
@@ -3703,14 +3792,41 @@ class MainWindow(QMainWindow):
         sub_mask = mask[ymin:ymax+1, xmin:xmax+1].astype(bool)
         if sub_elev.size == 0:
             return
-        depth = float(self.depth_spin.value())
-        # Bottom is flat at (max elevation within mask) - depth
-        max_in_mask = float(sub_elev[sub_mask].max()) if sub_mask.any() else float(sub_elev.max())
-        bottom_height = max_in_mask - depth
-        dig = np.maximum(0.0, sub_elev - bottom_height)
-        dig = np.where(sub_mask, dig, 0.0)
-        self.lbl_min.setText(f"Min dig: {dig[sub_mask].min() if sub_mask.any() else 0.0:.2f} m")
-        self.lbl_max.setText(f"Max dig: {dig[sub_mask].max() if sub_mask.any() else 0.0:.2f} m")
+        default_depth = float(self.depth_spin.value())
+        surface_source = getattr(self.scene, 'foundation_original_elevation', None)
+        if surface_source is None or surface_source.shape != self.last_placed_elevation.shape:
+            surface_source = self.last_placed_elevation
+        surface_sub = surface_source[ymin:ymax+1, xmin:xmax+1]
+        max_in_mask = float(surface_sub[sub_mask].max()) if sub_mask.any() else float(surface_sub.max())
+
+        depth_map_scene = getattr(self.scene, 'foundation_depth_map', None)
+        depth_values = []
+
+        def _rel_depth_from_value(stored_val: float, gx: int, gy: int) -> float:
+            if abs(stored_val) <= 1e-6:
+                return default_depth
+            if stored_val > 100 and surface_source is not None:
+                surface_z = surface_source[gy, gx]
+                return max(0.0, surface_z - stored_val)
+            return max(0.0, float(stored_val))
+
+        if depth_map_scene is not None:
+            for gx, gy in zip(xx, yy):
+                if 0 <= gy < depth_map_scene.shape[0] and 0 <= gx < depth_map_scene.shape[1]:
+                    val = float(depth_map_scene[gy, gx])
+                    depth_values.append(_rel_depth_from_value(val, gx, gy))
+        if not depth_values:
+            depth_values = [default_depth] * len(yy)
+
+        min_depth = min(depth_values) if depth_values else 0.0
+        max_depth = max(depth_values) if depth_values else 0.0
+        self.lbl_min.setText(f"Min dig: {min_depth:.2f} m")
+        self.lbl_max.setText(f"Max dig: {max_depth:.2f} m")
+
+        # Use deepest depth when drawing flat bottom reference
+        bottom_ref_depth = max_depth if depth_values else default_depth
+        bottom_height = max_in_mask - bottom_ref_depth
+        depth_label_value = bottom_ref_depth
         def compute_profile_x(elev: np.ndarray, msk: np.ndarray) -> np.ndarray:
             vals = []
             for c in range(elev.shape[1]):
@@ -3782,7 +3898,7 @@ class MainWindow(QMainWindow):
             t_min.setBrush(annot_brush)
             t_min_rect = t_min.boundingRect()
             t_min.setPos(margin + 4, view_h - margin - t_min_rect.height() - 2)
-            t_depth = scene.addSimpleText(f"Depth: {depth:.2f} m")
+            t_depth = scene.addSimpleText(f"Depth: {depth_label_value:.2f} m")
             t_depth.setBrush(annot_brush)
             t_depth_rect = t_depth.boundingRect()
             t_depth.setPos(view_w - margin - t_depth_rect.width() - 4, margin + 2)
@@ -3821,6 +3937,120 @@ class MainWindow(QMainWindow):
         draw_profile(self.profile_scene_x, prof_x, "Profile X (columns)")
         draw_profile(self.profile_scene_y, prof_y, "Profile Y (rows)")
 
+    def flatten_dig_plane(self) -> None:
+        """Flatten the selected foundation floor to the maximum dig depth (deepest bottom)."""
+        if self.last_placed_elevation is None:
+            return
+        mask = getattr(self.scene, 'foundation_mask', None)
+        if mask is None:
+            return
+        selected_group = self.scene.selected_foundation_group
+        if selected_group is not None and selected_group.get('cells'):
+            cells = [(x, y) for (x, y) in selected_group['cells']
+                     if 0 <= x < self.scene.grid_size and 0 <= y < self.scene.grid_size]
+        else:
+            yy, xx = np.where(mask == 1)
+            cells = list(zip(xx.tolist(), yy.tolist()))
+        if not cells:
+            return
+
+        if self.scene.foundation_depth_map is None:
+            self.scene.foundation_depth_map = np.zeros((self.scene.grid_size, self.scene.grid_size), dtype=np.float32)
+
+        default_depth = float(self.depth_spin.value())
+        surface_source = getattr(self.scene, 'foundation_original_elevation', None)
+        if surface_source is None or surface_source.shape != self.last_placed_elevation.shape:
+            surface_source = self.last_placed_elevation
+
+        def _relative_depth_for_cell(x: int, y: int) -> float:
+            """Return relative depth (meters) for cell."""
+            candidate = None
+            if selected_group is not None:
+                group_depth_map = selected_group.get('depth_map')
+                if group_depth_map is not None and (x, y) in group_depth_map:
+                    candidate = group_depth_map[(x, y)]
+            if candidate is None and self.scene.foundation_depth_map is not None:
+                candidate = self.scene.foundation_depth_map[y, x]
+            if candidate is None or abs(candidate) <= 1e-6:
+                return default_depth
+            if candidate > 100 and surface_source is not None:
+                surface_z = surface_source[y, x]
+                return max(0.0, surface_z - candidate)
+            return float(candidate)
+        bottom_heights = {}
+        for x, y in cells:
+            if not (0 <= x < self.scene.grid_size and 0 <= y < self.scene.grid_size):
+                continue
+            rel_depth = _relative_depth_for_cell(x, y)
+            surface_z = surface_source[y, x] if surface_source is not None else self.last_placed_elevation[y, x]
+            bottom_heights[(x, y)] = surface_z - rel_depth
+
+        if not bottom_heights:
+            return
+
+        target_bottom = max(bottom_heights.values())
+
+        cells_set = set(bottom_heights.keys())
+
+        for (x, y) in cells_set:
+            self.scene.foundation_mask[y, x] = 1
+            if surface_source is not None:
+                surface_z = surface_source[y, x]
+            else:
+                surface_z = self.last_placed_elevation[y, x]
+            target_depth = max(0.0, surface_z - target_bottom)
+            self.scene.foundation_depth_map[y, x] = target_depth
+        print(f"Flatten: set {len(cells_set)} cells to bottom {target_bottom:.3f} m (absolute)")
+        if hasattr(self, 'desired_elevation_canvas') and self.desired_elevation_canvas is not None:
+            des_canvas = self.desired_elevation_canvas
+            updated = 0
+            for (x, y) in cells_set:
+                if 0 <= y < des_canvas.shape[0] and 0 <= x < des_canvas.shape[1]:
+                    des_canvas[y, x] = target_bottom
+                    updated += 1
+            print(f"  Flatten verification: updated desired canvas cells={updated}")
+
+        def _update_group_maps(group: dict) -> None:
+            if group is None:
+                return
+            group_cells = group.get('cells', [])
+            if not group_cells:
+                return
+            group_map = group.get('depth_map')
+            if group_map is None:
+                group_map = {}
+                group['depth_map'] = group_map
+            abs_map = group.get('absolute_z')
+            for cell in group_cells:
+                if cell not in cells_set:
+                    continue
+                x, y = cell
+                surface_z = surface_source[y, x] if surface_source is not None else self.last_placed_elevation[y, x]
+                dive_depth = max(0.0, surface_z - target_bottom)
+                group_map[cell] = dive_depth
+                if abs_map is not None:
+                    abs_map[cell] = target_bottom
+
+        if selected_group is not None:
+            _update_group_maps(selected_group)
+        else:
+            for group in getattr(self.scene, 'foundation_groups', []):
+                if not group or not group.get('cells'):
+                    continue
+                group_cell_set = set(group['cells'])
+                if group_cell_set & cells_set:
+                    _update_group_maps(group)
+
+        # Refresh displays
+        if callable(getattr(self.scene, 'on_mask_changed', None)):
+            self.scene.on_mask_changed()
+        else:
+            self.update_foundation_profile()
+            self.update_3d_view()
+
+        if selected_group is not None:
+            self.on_group_selected(selected_group)
+
     # ----- Export -----
     def on_export(self) -> None:
         out_dir = QFileDialog.getExistingDirectory(self, "Select export folder", os.getcwd())
@@ -3852,7 +4082,7 @@ class MainWindow(QMainWindow):
         terra_colors = {
             "neutral": [220, 220, 220],  # Light Gray
             "digging": [255, 255, 255],  # White
-            "dumping": [90, 191, 20],  # Green
+            "dumping": [90, 191, 20],  # Green 
             "nondumpable": [255, 0, 0],  # Red
             "obstacle": [0, 0, 255],  # Blue
             "dirt": [19, 69, 139],  # Brown
@@ -3924,12 +4154,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export", "No elevation grid available to export.")
             return
 
+        grid_region_mask = None
+        grid_region_bounds = None
+        grid_region_array = None
+
         # Use original elevation array if available (for bag file export), otherwise use resized
         # Keep a copy of the original elevation for desired_elevation calculation
         original_elev_for_desired = None
-        if hasattr(self, 'original_elevation_array') and self.original_elevation_array is not None:
-            elev = self.original_elevation_array.copy()
-            original_elev_for_desired = self.original_elevation_array.copy()  # Keep original for desired_elevation
+        if hasattr(self, '_base_original_elevation_array') and self._base_original_elevation_array is not None:
+            elev = self._base_original_elevation_array.copy()
+            original_elev_for_desired = self._base_original_elevation_array.copy()  # Keep original for desired_elevation
             orig_H, orig_W = elev.shape
             # Get resized canvas shape (before placement)
             # Use the same canvas that was used in apply_placement
@@ -3946,9 +4180,18 @@ class MainWindow(QMainWindow):
             resized_H, resized_W = canvas_to_use_export.shape
             print(f"  Export canvas: {resized_H}×{resized_W} (desired_elev={hasattr(self, 'desired_elevation_canvas') and self.desired_elevation_canvas is not None}, last_pcl={hasattr(self, 'last_pcl_canvas') and self.last_pcl_canvas is not None})")
             
-            # Calculate mapping ratio
-            ratio_y = orig_H / resized_H
-            ratio_x = orig_W / resized_W
+            # Determine base (unrotated) canvas size
+            base_canvas_H = resized_H
+            base_canvas_W = resized_W
+            if hasattr(self, '_base_desired_canvas') and self._base_desired_canvas is not None:
+                base_canvas_H, base_canvas_W = self._base_desired_canvas.shape
+            elif hasattr(self, '_base_canvas') and self._base_canvas is not None:
+                base_canvas_H, base_canvas_W = self._base_canvas.shape
+            print(f"  Base canvas size: {base_canvas_H}×{base_canvas_W}, Rotated canvas size: {resized_H}×{resized_W}")
+            
+            # Calculate mapping ratio (use base canvas size)
+            ratio_y = orig_H / base_canvas_H
+            ratio_x = orig_W / base_canvas_W
             cells_per_tile = ratio_y * ratio_x
             
             foundation_mask_placed = self.scene.foundation_mask.astype(bool)
@@ -3972,12 +4215,6 @@ class MainWindow(QMainWindow):
                 # Verify canvas dimensions match
                 if stored_canvas_w != resized_W or stored_canvas_h != resized_H:
                     print(f"  WARNING: Canvas dimensions mismatch! Stored: {stored_canvas_w}×{stored_canvas_h}, Current: {resized_W}×{resized_H}")
-                    # Use stored canvas dimensions for bounds checking if they differ
-                    bounds_w = stored_canvas_w
-                    bounds_h = stored_canvas_h
-                else:
-                    bounds_w = resized_W
-                    bounds_h = resized_H
                 # Debug: also calculate what it would be with current canvas to compare
                 if mode == "topleft":
                     calc_start_x = int(np.floor(resized_W / 2.0 - placed_W / 2.0) + offx)
@@ -3987,18 +4224,8 @@ class MainWindow(QMainWindow):
                     test_start_x = int(np.floor(stored_canvas_w / 2.0 - placed_W / 2.0) + offx)
                     test_start_y = int(np.floor(stored_canvas_h / 2.0 - placed_H / 2.0) + offy)
                     print(f"  Verification: apply_placement with stored canvas would give start=({test_start_x},{test_start_y}), stored start=({start_x},{start_y}), match=({start_x==test_start_x},{start_y==test_start_y})")
-                    # If consistently 3 tiles off, adjust start coordinates
-                    # This accounts for any systematic offset in the coordinate mapping
-                    if start_x == test_start_x and start_y == test_start_y:
-                        print(f"  NOTE: Stored values match apply_placement calculation.")
-                        # Apply +3 offset to correct for consistent 3-tile offset (too far right/up means we need to add)
-                        start_x = start_x - 2
-                        start_y = start_y + 2
-                        print(f"  Adjusted start coordinates by +-2: new start=({start_x},{start_y})")
             else:
                 # Fallback: recalculate (shouldn't happen if placement was done)
-                bounds_w = resized_W
-                bounds_h = resized_H
                 print(f"  WARNING: No stored placement params, recalculating...")
                 mode_text = getattr(self, 'placement_combo', None)
                 if mode_text is not None:
@@ -4052,7 +4279,25 @@ class MainWindow(QMainWindow):
                     test_oy = int(round((test_resized_cx * mpt) / orig_resolution))
                     print(f"  Debug mapping: canvas[{test_resized_cy},{test_resized_cx}] -> original[{test_oy},{test_ox}] (mpt={mpt}, resolution={orig_resolution})")
             
-            def map_mask_to_original(mask_placed, label):
+            def _center_crop_or_pad(arr: np.ndarray, target_h: int, target_w: int, fill_value: float = 0.0) -> np.ndarray:
+                arr_h, arr_w = arr.shape
+                if arr_h == target_h and arr_w == target_w:
+                    return arr
+                result = np.full((target_h, target_w), fill_value, dtype=arr.dtype)
+                # Determine overlap region
+                src_y = max((arr_h - target_h) // 2, 0)
+                src_x = max((arr_w - target_w) // 2, 0)
+                dst_y = max((target_h - arr_h) // 2, 0)
+                dst_x = max((target_w - arr_w) // 2, 0)
+                copy_h = min(arr_h, target_h)
+                copy_w = min(arr_w, target_w)
+                result[dst_y:dst_y + copy_h, dst_x:dst_x + copy_w] = arr[src_y:src_y + copy_h, src_x:src_x + copy_w]
+                return result
+
+            rotation_deg = getattr(self, 'rotation_deg', 0.0)
+            transpose_bg = getattr(self.scene, 'transpose_background', True)
+
+            def map_mask_to_canvas_then_original(mask_placed, label):
                 if mask_placed is None:
                     print(f"  NOTE: No {label} mask available to map.")
                     return np.zeros((orig_H, orig_W), dtype=bool), 0
@@ -4060,22 +4305,44 @@ class MainWindow(QMainWindow):
                 if mask_bool.shape != (placed_H, placed_W):
                     print(f"  WARNING: {label} mask shape {mask_bool.shape} != placed grid {(placed_H, placed_W)}; skipping mapping.")
                     return np.zeros((orig_H, orig_W), dtype=bool), 0
-                mapped_mask = np.zeros((orig_H, orig_W), dtype=bool)
-                mapped_cells = 0
-                source_tiles = int(np.count_nonzero(mask_bool))
-                
+                canvas_mask_rot = np.zeros((resized_H, resized_W), dtype=bool)
                 for cy in range(placed_H):
                     for cx in range(placed_W):
                         if not mask_bool[cy, cx]:
                             continue
-                        resized_cy = start_y + cy
-                        resized_cx = start_x + cx
-                        if resized_cy < 0 or resized_cy >= bounds_h or resized_cx < 0 or resized_cx >= bounds_w:
+                        # Account for optional display transpose (arr.T in GridScene)
+                        if transpose_bg:
+                            resized_cy = start_y + cx
+                            resized_cx = start_x + cy
+                        else:
+                            resized_cy = start_y + cy
+                            resized_cx = start_x + cx
+                        if 0 <= resized_cy < resized_H and 0 <= resized_cx < resized_W:
+                            canvas_mask_rot[resized_cy, resized_cx] = True
+                canvas_mask = canvas_mask_rot
+                if abs(rotation_deg) > 1e-6:
+                    try:
+                        mask_img = Image.fromarray((canvas_mask_rot.astype(np.float32) * 255.0).astype(np.uint8), mode='L')
+                        unrot = mask_img.rotate(-rotation_deg, resample=Image.BILINEAR, expand=True)
+                        unrot_arr = (np.array(unrot, dtype=np.float32) / 255.0) > 0.5
+                        canvas_mask = _center_crop_or_pad(unrot_arr.astype(bool), base_canvas_H, base_canvas_W, False)
+                    except Exception as e:
+                        print(f"  WARNING: Failed to unrotate {label} mask: {e}")
+                        canvas_mask = _center_crop_or_pad(canvas_mask, base_canvas_H, base_canvas_W, False)
+                else:
+                    if canvas_mask.shape != (base_canvas_H, base_canvas_W):
+                        canvas_mask = _center_crop_or_pad(canvas_mask, base_canvas_H, base_canvas_W, False)
+                mapped_mask = np.zeros((orig_H, orig_W), dtype=bool)
+                mapped_cells = 0
+                source_tiles = int(np.count_nonzero(mask_bool))
+                for cy in range(base_canvas_H):
+                    for cx in range(base_canvas_W):
+                        if not canvas_mask[cy, cx]:
                             continue
-                        ox_start = int(round((resized_cy * mpt) / orig_resolution))
-                        ox_end = int(round(((resized_cy + 1) * mpt) / orig_resolution))
-                        oy_start = int(round((resized_cx * mpt) / orig_resolution))
-                        oy_end = int(round(((resized_cx + 1) * mpt) / orig_resolution))
+                        oy_start = int(round(cy * ratio_y))
+                        oy_end = int(round((cy + 1) * ratio_y))
+                        ox_start = int(round(cx * ratio_x))
+                        ox_end = int(round((cx + 1) * ratio_x))
                         if ox_end <= ox_start:
                             ox_end = ox_start + 1
                         if oy_end <= oy_start:
@@ -4086,22 +4353,49 @@ class MainWindow(QMainWindow):
                         ox_end = max(0, min(ox_end, orig_W))
                         mapped_mask[oy_start:oy_end, ox_start:ox_end] = True
                         mapped_cells += (oy_end - oy_start) * (ox_end - ox_start)
-                
                 nonzero = int(np.count_nonzero(mapped_mask))
                 print(f"  Mapped {mapped_cells} {label} cells to original grid (result non-zero cells: {nonzero}, placed tiles: {source_tiles})")
                 if nonzero == 0 and source_tiles > 0:
                     print(f"  WARNING: {label} mask is empty after mapping! This indicates a coordinate mapping issue.")
                 return mapped_mask, nonzero
             
-            foundation_mask, _ = map_mask_to_original(foundation_mask_placed, "foundation")
+            foundation_mask, _ = map_mask_to_canvas_then_original(foundation_mask_placed, "foundation")
             foundation_array = np.zeros((orig_H, orig_W), dtype=np.float32)
             foundation_array[foundation_mask] = 1.0
+
+            # Map full grid region (square workspace) to original coordinates for metadata + layer export
+            try:
+                full_grid_mask = np.ones_like(foundation_mask_placed, dtype=bool)
+                grid_region_mask, _ = map_mask_to_canvas_then_original(full_grid_mask, "grid region")
+                if grid_region_mask is not None:
+                    grid_region_array = grid_region_mask.astype(np.float32)
+                grid_coords = np.argwhere(grid_region_mask)
+                if grid_coords.size > 0:
+                    row_min = int(grid_coords[:, 0].min())
+                    row_max = int(grid_coords[:, 0].max())
+                    col_min = int(grid_coords[:, 1].min())
+                    col_max = int(grid_coords[:, 1].max())
+                    grid_region_bounds = {
+                        "row_start": row_min,
+                        "row_end": row_max + 1,
+                        "col_start": col_min,
+                        "col_end": col_max + 1,
+                        "row_start_m": float(row_min * orig_resolution),
+                        "row_end_m": float((row_max + 1) * orig_resolution),
+                        "col_start_m": float(col_min * orig_resolution),
+                        "col_end_m": float((col_max + 1) * orig_resolution),
+                    }
+                    print(f"  Grid region bounds (original grid coords): rows {row_min}-{row_max}, cols {col_min}-{col_max}")
+                else:
+                    print("  WARNING: Grid region mask empty after mapping.")
+            except Exception as grid_exc:
+                print(f"  WARNING: Failed to map grid region: {grid_exc}")
             
             # Map obstacle mask to occupancy grid using the same transformation
             obstacle_mask_placed = getattr(self.scene, 'obstacle_mask', None)
             if obstacle_mask_placed is not None:
                 obstacle_mask_bool = obstacle_mask_placed.astype(bool)
-                obstacle_mask_original, obstacle_original_tiles = map_mask_to_original(obstacle_mask_bool, "obstacle/occupancy")
+                obstacle_mask_original, obstacle_original_tiles = map_mask_to_canvas_then_original(obstacle_mask_bool, "obstacle/occupancy")
                 occupancy_array = np.zeros((orig_H, orig_W), dtype=np.float32)
                 occupancy_array[obstacle_mask_original] = 1.0
                 print(f"  Export: occupancy array has {int(np.count_nonzero(occupancy_array))} occupied cells")
@@ -4112,7 +4406,7 @@ class MainWindow(QMainWindow):
             dump_mask_placed = getattr(self.scene, 'dump_mask', None)
             if dump_mask_placed is not None:
                 dump_mask_bool = dump_mask_placed.astype(bool)
-                dump_mask_original, dump_original_tiles = map_mask_to_original(dump_mask_bool, "dump zone")
+                dump_mask_original, dump_original_tiles = map_mask_to_canvas_then_original(dump_mask_bool, "dump zone")
                 dump_zone_array = np.zeros((orig_H, orig_W), dtype=np.float32)
                 dump_zone_array[dump_mask_original] = 1.0
                 print(f"  Export: dump zone array has {int(np.count_nonzero(dump_zone_array))} dump cells")
@@ -4123,43 +4417,65 @@ class MainWindow(QMainWindow):
             depth_map_placed = getattr(self.scene, 'foundation_depth_map', None)
             depth_map = None
             if depth_map_placed is not None:
-                depth_map = np.zeros((orig_H, orig_W), dtype=depth_map_placed.dtype)
-                # Iterate through placed grid and map each non-zero cell to original grid
+                canvas_depth_rot = np.zeros((resized_H, resized_W), dtype=np.float32)
                 for cy in range(placed_H):
                     for cx in range(placed_W):
-                        if foundation_mask_placed[cy, cx] and depth_map_placed[cy, cx] != 0:  # Only map where foundation exists and has depth
-                            # Map from placed grid to resized canvas coordinates (same as foundation mask)
-                            resized_cy = start_y + cy
-                            resized_cx = start_x + cx
-                            
-                            # Skip if outside resized canvas bounds (use stored canvas dimensions if available)
-                            if resized_cy < 0 or resized_cy >= bounds_h or resized_cx < 0 or resized_cx >= bounds_w:
-                                continue
-                            
-                            # Map from resized canvas to original using physical coordinates with coordinate swap
-                            # Use the same mpt and orig_resolution from above
-                            ox_start = int(round((resized_cy * mpt) / orig_resolution))  # resized_cy (row) -> ox (column)
-                            ox_end = int(round(((resized_cy + 1) * mpt) / orig_resolution))  # End is exclusive
-                            oy_start = int(round((resized_cx * mpt) / orig_resolution))  # resized_cx (column) -> oy (row)
-                            oy_end = int(round(((resized_cx + 1) * mpt) / orig_resolution))  # End is exclusive
-                            # Ensure at least one cell is covered
-                            if ox_end <= ox_start:
-                                ox_end = ox_start + 1
-                            if oy_end <= oy_start:
-                                oy_end = oy_start + 1
-                            # Clamp to valid range
-                            oy_start = max(0, min(oy_start, orig_H - 1))
-                            oy_end = max(0, min(oy_end, orig_H))
-                            ox_start = max(0, min(ox_start, orig_W - 1))
-                            ox_end = max(0, min(ox_end, orig_W))
-                            # Set all cells in this block to the same depth value
-                            depth_map[oy_start:oy_end, ox_start:ox_end] = depth_map_placed[cy, cx]
+                        if foundation_mask_placed[cy, cx] and depth_map_placed[cy, cx] != 0:
+                            if transpose_bg:
+                                resized_cy = start_y + cx
+                                resized_cx = start_x + cy
+                            else:
+                                resized_cy = start_y + cy
+                                resized_cx = start_x + cx
+                            if 0 <= resized_cy < resized_H and 0 <= resized_cx < resized_W:
+                                canvas_depth_rot[resized_cy, resized_cx] = depth_map_placed[cy, cx]
+                canvas_depth = canvas_depth_rot
+                if abs(rotation_deg) > 1e-6:
+                    try:
+                        depth_img = Image.fromarray(canvas_depth_rot.astype(np.float32), mode='F')
+                        unrot_depth = depth_img.rotate(-rotation_deg, resample=Image.BILINEAR, expand=True)
+                        canvas_depth = np.array(unrot_depth, dtype=np.float32)
+                    except Exception as e:
+                        print(f"  WARNING: Failed to unrotate depth map: {e}")
+                        canvas_depth = canvas_depth_rot
+                canvas_depth = _center_crop_or_pad(canvas_depth, base_canvas_H, base_canvas_W, 0.0)
+                depth_map = np.zeros((orig_H, orig_W), dtype=depth_map_placed.dtype)
+                for cy in range(base_canvas_H):
+                    for cx in range(base_canvas_W):
+                        value = canvas_depth[cy, cx]
+                        if abs(value) <= 1e-6:
+                            continue
+                        oy_start = int(round(cy * ratio_y))
+                        oy_end = int(round((cy + 1) * ratio_y))
+                        ox_start = int(round(cx * ratio_x))
+                        ox_end = int(round((cx + 1) * ratio_x))
+                        if ox_end <= ox_start:
+                            ox_end = ox_start + 1
+                        if oy_end <= oy_start:
+                            oy_end = oy_start + 1
+                        oy_start = max(0, min(oy_start, orig_H - 1))
+                        oy_end = max(0, min(oy_end, orig_H))
+                        ox_start = max(0, min(ox_start, orig_W - 1))
+                        ox_end = max(0, min(ox_end, orig_W))
+                        depth_map[oy_start:oy_end, ox_start:ox_end] = value
         else:
             # Fallback to resized array
             elev = self.last_placed_elevation.copy()
             original_elev_for_desired = self.last_placed_elevation.copy()  # Keep original for desired_elevation
             foundation_mask = self.scene.foundation_mask.astype(bool)
             depth_map = getattr(self.scene, 'foundation_depth_map', None)
+            grid_region_mask = np.ones_like(elev, dtype=bool)
+            grid_region_array = grid_region_mask.astype(np.float32)
+            grid_region_bounds = {
+                "row_start": 0,
+                "row_end": int(elev.shape[0]),
+                "col_start": 0,
+                "col_end": int(elev.shape[1]),
+                "row_start_m": 0.0,
+                "row_end_m": float(elev.shape[0] * getattr(self, 'original_gridmap_resolution', self.meters_per_tile)),
+                "col_start_m": 0.0,
+                "col_end_m": float(elev.shape[1] * getattr(self, 'original_gridmap_resolution', self.meters_per_tile)),
+            }
         
         # Apply foundation excavation: lower heights in foundation regions
         print(f"Export: foundation_mask has {np.count_nonzero(foundation_mask)} cells")
@@ -4224,7 +4540,7 @@ class MainWindow(QMainWindow):
         if os.path.exists(elev_npy_path):
             os.remove(elev_npy_path)
         np.save(elev_npy_path, elev.astype(np.float32))
-        
+
         # Export new bag file if original bag was loaded (skip for npy files)
         bag_path = None
         if self.original_bag_path and self.original_gridmap_msg and HAS_ROSBAGS:
@@ -4408,6 +4724,25 @@ class MainWindow(QMainWindow):
                                 # Fallback: use per-cell depth (shouldn't happen)
                                 desired_elev_array[foundation_mask] = original_elev_for_desired[foundation_mask] - default_depth
                     
+                    if foundation_mask.any():
+                        foundation_desired_vals = desired_elev_array[foundation_mask]
+                        if foundation_desired_vals.size > 0:
+                            min_desired = float(np.min(foundation_desired_vals))
+                            max_desired = float(np.max(foundation_desired_vals))
+                            mean_desired = float(np.mean(foundation_desired_vals))
+                            tol = 0.01  # 1 cm tolerance to verify flat regions
+                            bottom_count = int(np.count_nonzero(np.isclose(foundation_desired_vals, min_desired, atol=tol)))
+                            print(
+                                "  Desired elevation (foundation area): "
+                                f"min={min_desired:.3f} m, max={max_desired:.3f} m, "
+                                f"mean={mean_desired:.3f} m, cells={foundation_desired_vals.size}"
+                            )
+                            print(
+                                f"  Flat bottom verification: {bottom_count} cells within ±{tol:.3f} m of {min_desired:.3f} m"
+                            )
+                    else:
+                        print("  Desired elevation: foundation mask empty, no stats to report.")
+                    
                     # Convert to flat array for export
                     desired_elev_flat = desired_elev_array.ravel()
                     
@@ -4467,6 +4802,18 @@ class MainWindow(QMainWindow):
                             'idx': dump_idx,
                             'flat': dump_flat,
                             'shape': dump_zone_array.shape
+                        })
+                    if grid_region_array is not None:
+                        grid_region_layer_name = "grid_region_mask"
+                        if grid_region_layer_name not in layers:
+                            layers.append(grid_region_layer_name)
+                        grid_region_idx = layers.index(grid_region_layer_name)
+                        grid_region_flat = grid_region_array.astype(np.float32).ravel()
+                        layer_targets.append({
+                            'name': grid_region_layer_name,
+                            'idx': grid_region_idx,
+                            'flat': grid_region_flat,
+                            'shape': grid_region_array.shape
                         })
                     
                     import copy as copy_module
@@ -4746,6 +5093,88 @@ class MainWindow(QMainWindow):
             return np.zeros_like(arr, dtype=np.float32)
         return ((arr - amin) / (amax - amin)).astype(np.float32)
 
+    @staticmethod
+    def _compute_fill_value(arr: np.ndarray, default: float = 0.0) -> float:
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return default
+        return float(finite.min())
+
+    def _rotate_array(self, arr: Optional[np.ndarray], angle_deg: float, fill_value: Optional[float] = None) -> Optional[np.ndarray]:
+        if arr is None:
+            return None
+        if abs(angle_deg) < 1e-6:
+            return arr.copy()
+        safe_fill = float(fill_value if fill_value is not None else self._compute_fill_value(arr, 0.0))
+        base = np.where(np.isfinite(arr), arr, safe_fill).astype(np.float32)
+        try:
+            img = Image.fromarray(base, mode='F')
+            rotated_img = img.rotate(angle_deg, resample=Image.BILINEAR, expand=True)
+            rotated_arr = np.array(rotated_img, dtype=np.float32)
+            mask = np.ones_like(base, dtype=np.float32)
+            mask_img = Image.fromarray(mask, mode='F')
+            rotated_mask = mask_img.rotate(angle_deg, resample=Image.BILINEAR, expand=True)
+            mask_arr = np.array(rotated_mask, dtype=np.float32)
+            rotated_arr = np.where(mask_arr > 1e-3, rotated_arr, safe_fill)
+            return rotated_arr
+        except Exception:
+            return base.copy()
+
+    def _store_base_canvas(self, canvas: Optional[np.ndarray], apply_rotation: bool = True) -> None:
+        self._base_canvas = canvas.copy() if canvas is not None else None
+        if apply_rotation:
+            self._apply_rotation_to_bases()
+
+    def _store_base_desired_canvas(self, canvas: Optional[np.ndarray], apply_rotation: bool = True) -> None:
+        self._base_desired_canvas = canvas.copy() if canvas is not None else None
+        if apply_rotation:
+            self._apply_rotation_to_bases()
+
+    def _store_base_previous_desired_canvas(self, canvas: Optional[np.ndarray], apply_rotation: bool = True) -> None:
+        self._base_previous_desired_canvas = canvas.copy() if canvas is not None else None
+        if apply_rotation:
+            self._apply_rotation_to_bases()
+
+    def _store_base_original_elevation_array(self, arr: Optional[np.ndarray], apply_rotation: bool = True) -> None:
+        self._base_original_elevation_array = arr.copy() if arr is not None else None
+        if apply_rotation:
+            self._apply_rotation_to_bases()
+
+    def _store_base_original_desired_array(self, arr: Optional[np.ndarray], apply_rotation: bool = True) -> None:
+        self._base_original_desired_array = arr.copy() if arr is not None else None
+        if apply_rotation:
+            self._apply_rotation_to_bases()
+
+    def _store_base_original_previous_desired_array(self, arr: Optional[np.ndarray], apply_rotation: bool = True) -> None:
+        self._base_original_previous_desired_array = arr.copy() if arr is not None else None
+        if apply_rotation:
+            self._apply_rotation_to_bases()
+
+    def _apply_rotation_to_bases(self) -> None:
+        angle = float(getattr(self, "rotation_deg", 0.0))
+
+        def rotate_or_none(base: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            if base is None:
+                return None
+            fill = self._compute_fill_value(base, 0.0)
+            return self._rotate_array(base, angle, fill)
+
+        self.last_pcl_canvas = rotate_or_none(self._base_canvas)
+        self.desired_elevation_canvas = rotate_or_none(self._base_desired_canvas)
+        self.previous_desired_elevation_canvas = rotate_or_none(self._base_previous_desired_canvas)
+        self.original_elevation_array = (
+            self._base_original_elevation_array.copy()
+            if self._base_original_elevation_array is not None else None
+        )
+        self.original_desired_elevation_array = (
+            self._base_original_desired_array.copy()
+            if self._base_original_desired_array is not None else None
+        )
+        self.original_previous_desired_elevation_array = (
+            self._base_original_previous_desired_array.copy()
+            if self._base_original_previous_desired_array is not None else None
+        )
+
     def _apply_type_button_styles(self) -> None:
         dump_btn = self.toolbar.widgetForAction(self.action_type_dump)
         foundation_btn = self.toolbar.widgetForAction(self.action_type_foundation)
@@ -4813,14 +5242,17 @@ class MainWindow(QMainWindow):
                 "QToolButton:checked{background: rgba(0,0,0,0.12); border:2px solid rgba(0,0,0,0.35);}"
             )
 
+    def _configure_gnss_usage(self, enabled: bool) -> None:
+        """Toggle whether grid assets should be transposed/rotated for GNSS alignment."""
+        self.use_gnss_reference = bool(enabled)
+        if hasattr(self, 'scene') and self.scene is not None:
+            self.scene.transpose_background = self.use_gnss_reference
+
     def _build_bottom_bar(self) -> QWidget:
         # Ensure required widgets exist
         if not hasattr(self, 'btn_load_geo'):
             self.btn_load_geo = QPushButton("Load Geo Map")
             self.btn_load_geo.clicked.connect(self.on_load_geo_map)
-        if not hasattr(self, 'btn_dummy_pcl'):
-            self.btn_dummy_pcl = QPushButton("Dummy PCL")
-            self.btn_dummy_pcl.clicked.connect(self.on_dummy_pcl)
         if not hasattr(self, 'btn_export'):
             self.btn_export = QPushButton("Export")
             self.btn_export.setObjectName("exportBtn")
@@ -4842,6 +5274,13 @@ class MainWindow(QMainWindow):
             self.placement_combo.addItems(["Center", "Top-Left"])
             self.placement_combo.setCurrentText("Top-Left")
             self.placement_combo.currentTextChanged.connect(self.on_placement_changed)
+        if not hasattr(self, 'rotation_spin'):
+            self.rotation_spin = QDoubleSpinBox()
+            self.rotation_spin.setRange(-180.0, 180.0)
+            self.rotation_spin.setDecimals(1)
+            self.rotation_spin.setSingleStep(1.0)
+            self.rotation_spin.setValue(self.rotation_deg)
+            self.rotation_spin.valueChanged.connect(self.on_rotation_changed)
         # Add export target selector (includes format selection)
         if not hasattr(self, 'export_target_combo'):
             self.export_target_combo = QComboBox()
@@ -4871,7 +5310,6 @@ class MainWindow(QMainWindow):
         bottom_layout.addWidget(self.btn_load_foundation)
         bottom_layout.addWidget(QLabel("Map res (m/cell):"))
         bottom_layout.addWidget(self.map_res_spin)
-        bottom_layout.addWidget(self.btn_dummy_pcl)
         bottom_layout.addSpacing(12)
         bottom_layout.addWidget(QLabel("Grid Size:"))
         bottom_layout.addWidget(self.grid_size_combo)
@@ -4886,6 +5324,8 @@ class MainWindow(QMainWindow):
         bottom_layout.addWidget(self.offset_x_spin)
         bottom_layout.addWidget(QLabel("Offset Y:"))
         bottom_layout.addWidget(self.offset_y_spin)
+        bottom_layout.addWidget(QLabel("Rotation (deg):"))
+        bottom_layout.addWidget(self.rotation_spin)
         bottom_layout.addStretch(1)
         bottom_layout.addWidget(QLabel("Export to:"))
         bottom_layout.addWidget(self.export_target_combo)
@@ -4900,6 +5340,7 @@ class MainWindow(QMainWindow):
     def _clear_3d_items(self) -> None:
         if not HAS_GL or self.gl_view is None:
             return
+        # Clear all items from the view first
         for attr in ("gl_surface", "gl_plane"):
             itm = getattr(self, attr, None)
             if itm is not None:
@@ -4923,6 +5364,12 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             self.gl_contours = []
+        # Force a repaint to ensure everything is cleared
+        if self.gl_view is not None:
+            try:
+                self.gl_view.update()
+            except:
+                pass
 
     def update_3d_view(self) -> None:
         if not HAS_GL or self.gl_view is None:
@@ -5419,7 +5866,7 @@ class MainWindow(QMainWindow):
                 self.group_depth_spin.blockSignals(False)
     
     def on_group_depth_changed(self, value: float) -> None:
-        """Update depth for selected foundation group - scale proportionally."""
+        """Update depth for selected foundation group - delete and recreate with new depth."""
         if self.scene.selected_foundation_group is None:
             return
         
@@ -5428,6 +5875,30 @@ class MainWindow(QMainWindow):
         if not cells:
             return
         
+        # Step 1: Temporarily remove foundation (clear mask and depth, restore terrain)
+        for x, y in cells:
+            if 0 <= y < self.scene.grid_size and 0 <= x < self.scene.grid_size:
+                # Clear foundation mask
+                self.scene.foundation_mask[y, x] = 0
+                # Clear depth map
+                if self.scene.foundation_depth_map is not None:
+                    self.scene.foundation_depth_map[y, x] = 0
+                # Restore original terrain elevation
+                if self.scene.foundation_original_elevation is not None and callable(self.scene.get_elevation):
+                    try:
+                        elev = self.scene.get_elevation()
+                        if elev is not None and elev.shape == self.scene.foundation_original_elevation.shape:
+                            elev[y, x] = self.scene.foundation_original_elevation[y, x]
+                    except:
+                        pass
+        
+        # Step 2: Clear 3D view completely (removes all walls and foundation mesh)
+        self._clear_3d_items()
+        
+        # Step 3: Update 3D view to show terrain without foundation
+        self.update_3d_view()
+        
+        # Step 4: Calculate new depth values
         # Initialize depth map if needed
         if self.scene.foundation_depth_map is None:
             self.scene.foundation_depth_map = np.zeros((self.scene.grid_size, self.scene.grid_size), dtype=np.float32)
@@ -5480,21 +5951,23 @@ class MainWindow(QMainWindow):
         # Find max current depth
         if current_depths:
             max_current_depth = float(max(current_depths.values()))
-        
-        # Calculate scale factor
-        new_max_depth = float(value)
-        if max_current_depth > 1e-6:
-            scale_factor = new_max_depth / max_current_depth
         else:
-            # No existing depth, use uniform depth
-            scale_factor = 1.0
+            max_current_depth = 0.0
         
-        # Update all depths proportionally
-        # Update both scene depth map and group depth map
+        # Calculate depth difference (additive change, not multiplicative)
+        new_max_depth = float(value)
+        depth_difference = new_max_depth - max_current_depth
+        
+        # Step 5: Re-apply foundation with new depth values (add difference to each cell)
         for x, y in cells:
             if 0 <= x < self.scene.grid_size and 0 <= y < self.scene.grid_size:
+                # Restore foundation mask
+                self.scene.foundation_mask[y, x] = 1
+                # Calculate new depth: add difference to each cell's depth
                 old_depth = current_depths.get((x, y), 0.0)
-                new_depth = old_depth * scale_factor
+                new_depth = old_depth + depth_difference
+                # Ensure depth is not negative
+                new_depth = max(0.0, new_depth)
                 # Update scene depth map
                 self.scene.foundation_depth_map[y, x] = new_depth
         
@@ -5503,7 +5976,8 @@ class MainWindow(QMainWindow):
             for cell in cells:
                 if cell in current_depths:
                     old_depth = current_depths[cell]
-                    new_depth = old_depth * scale_factor
+                    new_depth = old_depth + depth_difference
+                    new_depth = max(0.0, new_depth)  # Ensure not negative
                     group['depth_map'][cell] = new_depth
         else:
             # Create depth map for group if it doesn't exist (for drawn groups that should have variable depth)
@@ -5511,10 +5985,11 @@ class MainWindow(QMainWindow):
             for x, y in cells:
                 if (x, y) in current_depths:
                     old_depth = current_depths[(x, y)]
-                    new_depth = old_depth * scale_factor
+                    new_depth = old_depth + depth_difference
+                    new_depth = max(0.0, new_depth)  # Ensure not negative
                     group['depth_map'][(x, y)] = new_depth
         
-        # Update 3D view to reflect new depth (clears old walls/bottoms and rebuilds)
+        # Step 6: Update 3D view to show foundation with new depth
         self.update_3d_view()
         self.update_foundation_profile()
 
