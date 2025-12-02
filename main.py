@@ -53,6 +53,8 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
 )
 
+from utils.manual_plan_generator import ManualPlanDialog
+
 # NumPy compatibility shim for pyqtgraph on NumPy>=2.0
 try:
     if not hasattr(np, "product"):
@@ -120,6 +122,15 @@ class GridScene(QGraphicsScene):
         self.nodump_mask = np.zeros((grid_size, grid_size), dtype=np.uint8)
         self.background_item: Optional[QGraphicsPixmapItem] = None
         self.transpose_background: bool = True  # swap axes for georef-aligned maps by default
+        # Manual plan integration (agent/dig/dump picking & overlays)
+        self.manual_pick_active: bool = False
+        self.manual_pick_callback = None  # type: Optional[callable]
+        self.manual_agent_item = None
+        # Temporary previews (per current selection)
+        self.manual_preview_dig_cells = []
+        self.manual_preview_dump_cells = []
+        # Whether planning mode is active (disable painting while true)
+        self.planning_mode_active: bool = False
         # Overlay image (satellite) support
         self.overlay_item: Optional[QGraphicsPixmapItem] = None
         self.overlay_scale: float = 1.0
@@ -1123,7 +1134,150 @@ class GridScene(QGraphicsScene):
             self._ruler_label = None
         self._ruler_start = None
 
+    # ----- Manual plan overlays (agent/dig/dump) -----
+    def set_manual_agent_marker(self, x: int, y: int) -> None:
+        """Draw or move a small marker at the agent base cell (x=col, y=row)."""
+        try:
+            from PyQt5.QtWidgets import QGraphicsEllipseItem
+        except Exception:
+            return
+        cx = x * CELL_SIZE + CELL_SIZE * 0.5
+        cy = y * CELL_SIZE + CELL_SIZE * 0.5
+        radius = CELL_SIZE * 0.35
+        if self.manual_agent_item is None:
+            item = QGraphicsEllipseItem(cx - radius, cy - radius, radius * 2.0, radius * 2.0)
+            item.setZValue(4.0)
+            item.setPen(QPen(QColor(255, 165, 0), 2))  # orange border
+            item.setBrush(QBrush(QColor(255, 165, 0, 80)))
+            self.addItem(item)
+            self.manual_agent_item = item
+        else:
+            self.manual_agent_item.setRect(cx - radius, cy - radius, radius * 2.0, radius * 2.0)
+
+    def set_manual_workspace_marker(self, kind: str, x: int, y: int, radius_tiles: float) -> None:
+        """
+        Visualize dig/dump workspaces as circles in grid coordinates.
+
+        kind: 'dig' or 'dump'
+        """
+        try:
+            from PyQt5.QtWidgets import QGraphicsEllipseItem
+        except Exception:
+            return
+        cx = x * CELL_SIZE + CELL_SIZE * 0.5
+        cy = y * CELL_SIZE + CELL_SIZE * 0.5
+        r_px = max(CELL_SIZE * 0.6, radius_tiles * CELL_SIZE)
+        color = QColor(0, 200, 0) if kind == "dump" else QColor(150, 40, 220)
+        alpha = 60
+        pen = QPen(color, 2)
+        brush = QBrush(QColor(color.red(), color.green(), color.blue(), alpha))
+        if kind == "dig":
+            target_attr = "manual_dig_item"
+        else:
+            target_attr = "manual_dump_item"
+        item = getattr(self, target_attr, None)
+        if item is None:
+            item = QGraphicsEllipseItem(cx - r_px, cy - r_px, r_px * 2.0, r_px * 2.0)
+            item.setZValue(3.5)
+            item.setPen(pen)
+            item.setBrush(brush)
+            self.addItem(item)
+            setattr(self, target_attr, item)
+        else:
+            item.setRect(cx - r_px, cy - r_px, r_px * 2.0, r_px * 2.0)
+            item.setPen(pen)
+            item.setBrush(brush)
+
+    def set_manual_workspace_cone(self, kind: str, mask: np.ndarray) -> None:
+        """Preview a cone-shaped workspace or ring by tinting True cells (temporary overlay)."""
+        # Keep separate previews for dig and dump so they can be visible together
+        items_attr = "manual_preview_dig_cells" if kind == "dig" else "manual_preview_dump_cells"
+        items = getattr(self, items_attr, [])
+        # Clear old items
+        for it in items:
+            try:
+                self.removeItem(it)
+            except Exception:
+                pass
+        items = []
+        h, w = mask.shape
+        # Softer preview style; permanent cones use a stronger, outlined style
+        color = QColor(0, 200, 0, 60) if kind == "dump" else QColor(150, 40, 220, 60)
+        pen = QPen(Qt.NoPen)
+        brush = QBrush(color)
+        ys, xs = np.nonzero(mask)
+        for y, x in zip(ys, xs):
+            rect = QRectF(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+            it = QGraphicsRectItem(rect)
+            it.setZValue(3.4)
+            it.setPen(pen)
+            it.setBrush(brush)
+            self.addItem(it)
+            items.append(it)
+        setattr(self, items_attr, items)
+
+    def add_manual_workspace_cone(self, kind: str, mask: np.ndarray, label: str = ""):
+        """Add a permanent cone overlay for a waypoint; returns list of created items.
+
+        These are drawn more saturated with a red outline to indicate committed waypoints.
+        """
+        items = []
+        h, w = mask.shape
+        base_color = QColor(0, 200, 0) if kind == "dump" else QColor(150, 40, 220)
+        color = QColor(base_color.red(), base_color.green(), base_color.blue(), 130)
+        pen = QPen(QColor(255, 0, 0))
+        pen.setWidth(1)
+        brush = QBrush(color)
+        ys, xs = np.nonzero(mask)
+        for y, x in zip(ys, xs):
+            rect = QRectF(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+            it = QGraphicsRectItem(rect)
+            it.setZValue(3.3)
+            it.setPen(pen)
+            it.setBrush(brush)
+            self.addItem(it)
+            items.append(it)
+
+        # Add optional numeric label at cone center
+        if label:
+            try:
+                if ys.size > 0 and xs.size > 0:
+                    cy = ys.mean()
+                    cx = xs.mean()
+                    tx = (cx + 0.5) * CELL_SIZE
+                    ty = (cy + 0.5) * CELL_SIZE
+                    text_item = QGraphicsSimpleTextItem(str(label))
+                    text_item.setBrush(QBrush(QColor(255, 0, 0)))
+                    f = QFont()
+                    f.setBold(True)
+                    f.setPointSize(10)
+                    text_item.setFont(f)
+                    text_item.setZValue(3.6)
+                    text_item.setPos(tx, ty)
+                    self.addItem(text_item)
+                    items.append(text_item)
+            except Exception:
+                pass
+        return items
+
     def mousePressEvent(self, event) -> None:
+        # Manual plan cell picking (agent/dig/dump) takes precedence over painting
+        if getattr(self, "manual_pick_active", False) and event.button() == Qt.LeftButton:
+            pos = event.scenePos()
+            cell = self._cell_from_pos(pos)
+            if cell is not None and callable(getattr(self, "manual_pick_callback", None)):
+                x, y = cell
+                cb = self.manual_pick_callback
+                # Reset picking state before callback to avoid re-entrancy issues
+                self.manual_pick_active = False
+                self.manual_pick_callback = None
+                try:
+                    cb(x, y)
+                except Exception as exc:
+                    print(f"Manual pick callback error: {exc}")
+            event.accept()
+            return
+
         if self.tool_mode == "select":
             # Check if clicking on a foundation group outline or cells
             pos = event.scenePos()
@@ -1179,6 +1333,10 @@ class GridScene(QGraphicsScene):
             pos = event.scenePos()
             cell = self._cell_from_pos(pos)
             if cell is not None:
+                # Disable painting while planning mode is active (but allow manual picks handled above)
+                if getattr(self, "planning_mode_active", False) and self.tool_mode in ("cell", "rect", "polygon"):
+                    event.accept()
+                    return
                 if self.tool_mode == "cell":
                     # Set painting flag to defer 3D updates
                     self._is_painting = True
@@ -1603,9 +1761,20 @@ class MainWindow(QMainWindow):
             self.action_type_nodump,
             self.action_type_eraser,
         ])
-        self.toolbar.addSeparator()
         self.action_clear = QAction("Clear", self)
         self.toolbar.addAction(self.action_clear)
+        # Separator line just below Clear
+        self.toolbar.addSeparator()
+        # Planning section (manual plan) – placed just below separator
+        planning_label = QLabel("Planning:")
+        planning_label.setProperty("class", "sectionLabel")
+        planning_label.setStyleSheet("QLabel { color:#6b6b6b; font-weight:600; }")
+        planning_label_act = QWidgetAction(self)
+        planning_label_act.setDefaultWidget(planning_label)
+        self.action_manual_plan = QAction(_make_symbol_icon("P"), "Manual Plan", self)
+        self.action_manual_plan.setCheckable(False)
+        self.toolbar.addAction(planning_label_act)
+        self.toolbar.addAction(self.action_manual_plan)
         self.action_tool_select.triggered.connect(self.on_tool_select)
         self.action_tool_cell.triggered.connect(self.on_tool_cell)
         self.action_tool_rect.triggered.connect(self.on_tool_rect)
@@ -1616,6 +1785,7 @@ class MainWindow(QMainWindow):
         self.action_type_obstacle.triggered.connect(lambda: self.on_type_change("obstacle"))
         self.action_type_nodump.triggered.connect(lambda: self.on_type_change("nodump"))
         self.action_type_eraser.triggered.connect(lambda: self.on_type_change("eraser"))
+        self.action_manual_plan.triggered.connect(self.on_manual_plan_clicked)
         self.action_clear.triggered.connect(self.on_clear_paint)
 
         # Zoom control in left toolbar (centered like the buttons)
@@ -5217,6 +5387,7 @@ class MainWindow(QMainWindow):
         rect_btn = self.toolbar.widgetForAction(self.action_tool_rect)
         polygon_btn = self.toolbar.widgetForAction(self.action_tool_polygon)
         ruler_btn = self.toolbar.widgetForAction(self.action_tool_ruler)
+        manual_plan_btn = self.toolbar.widgetForAction(getattr(self, "action_manual_plan", None)) if hasattr(self, "action_manual_plan") else None
         if cell_btn is not None:
             cell_btn.setStyleSheet(
                 "QToolButton{background: rgba(0,0,0,0.04); border:1px solid rgba(0,0,0,0.12); border-radius:8px;}"
@@ -5241,12 +5412,31 @@ class MainWindow(QMainWindow):
                 "QToolButton:hover{background: rgba(0,0,0,0.08);}"
                 "QToolButton:checked{background: rgba(0,0,0,0.12); border:2px solid rgba(0,0,0,0.35);}"
             )
+        if manual_plan_btn is not None:
+            manual_plan_btn.setStyleSheet(
+                "QToolButton{background: qlineargradient(x1:0,y1:0,x2:1,y2:1, "
+                "stop:0 #fdf3e7, stop:1 #f9d29d);"
+                " border:1px solid #f0a54b; border-radius:10px; padding:6px;}"
+                "QToolButton:hover{background: qlineargradient(x1:0,y1:0,x2:1,y2:1, "
+                "stop:0 #ffe5c4, stop:1 #f9c27d);}"
+                "QToolButton:pressed{background: #f0a54b;}"
+            )
 
     def _configure_gnss_usage(self, enabled: bool) -> None:
         """Toggle whether grid assets should be transposed/rotated for GNSS alignment."""
         self.use_gnss_reference = bool(enabled)
         if hasattr(self, 'scene') and self.scene is not None:
             self.scene.transpose_background = self.use_gnss_reference
+
+    def on_placement_toggle(self, checked: bool) -> None:
+        """Show/hide the placement controls panel from the bottom bar."""
+        try:
+            if hasattr(self, "placement_panel") and self.placement_panel is not None:
+                self.placement_panel.setVisible(bool(checked))
+            if hasattr(self, "placement_toggle") and self.placement_toggle is not None:
+                self.placement_toggle.setText("Placement ▾" if checked else "Placement ▸")
+        except Exception:
+            pass
 
     def _build_bottom_bar(self) -> QWidget:
         # Ensure required widgets exist
@@ -5317,20 +5507,65 @@ class MainWindow(QMainWindow):
         bottom_layout.addWidget(QLabel("Meters/Tile:"))
         bottom_layout.addWidget(self.meters_spin)
         bottom_layout.addSpacing(12)
-        bottom_layout.addWidget(QLabel("Placement:"))
-        bottom_layout.addWidget(self.placement_combo)
-        bottom_layout.addSpacing(12)
-        bottom_layout.addWidget(QLabel("Offset X:"))
-        bottom_layout.addWidget(self.offset_x_spin)
-        bottom_layout.addWidget(QLabel("Offset Y:"))
-        bottom_layout.addWidget(self.offset_y_spin)
-        bottom_layout.addWidget(QLabel("Rotation (deg):"))
-        bottom_layout.addWidget(self.rotation_spin)
+
+        # Collapsible placement panel
+        self.placement_toggle = QPushButton("Placement ▾")
+        self.placement_toggle.setCheckable(True)
+        self.placement_toggle.setChecked(False)
+        self.placement_toggle.setStyleSheet(
+            "QPushButton{background:#f7f7f9; border:1px solid #e3e3e7; border-radius:6px; padding:4px 8px;}"
+            "QPushButton:checked{background:#e6f0ff; border-color:#99c3ff;}"
+        )
+        self.placement_toggle.toggled.connect(self.on_placement_toggle)
+        bottom_layout.addWidget(self.placement_toggle)
+
+        self.placement_panel = QWidget()
+        placement_layout = QHBoxLayout()
+        placement_layout.setContentsMargins(6, 0, 0, 0)
+        placement_layout.setSpacing(6)
+        placement_layout.addWidget(QLabel("Mode:"))
+        placement_layout.addWidget(self.placement_combo)
+        placement_layout.addWidget(QLabel("Off X:"))
+        self.offset_x_spin.setFixedWidth(70)
+        placement_layout.addWidget(self.offset_x_spin)
+        placement_layout.addWidget(QLabel("Off Y:"))
+        self.offset_y_spin.setFixedWidth(70)
+        placement_layout.addWidget(self.offset_y_spin)
+        placement_layout.addWidget(QLabel("Rot:"))
+        self.rotation_spin.setFixedWidth(80)
+        placement_layout.addWidget(self.rotation_spin)
+        self.placement_panel.setLayout(placement_layout)
+        self.placement_panel.setVisible(False)
+        bottom_layout.addWidget(self.placement_panel)
         bottom_layout.addStretch(1)
         bottom_layout.addWidget(QLabel("Export to:"))
         bottom_layout.addWidget(self.export_target_combo)
         bottom_layout.addWidget(self.btn_export)
         return bottom_bar
+
+    def on_manual_plan_clicked(self) -> None:
+        """Open the floating manual-plan dialog while keeping the main canvas usable."""
+        try:
+            if not hasattr(self, "manual_plan_dialog") or self.manual_plan_dialog is None:
+                self.manual_plan_dialog = ManualPlanDialog(
+                    self,
+                    grid_size=self.grid_size,
+                    default_map_root=os.path.join(os.getcwd(), "map"),
+                    scene=self.scene,
+                    tile_size=self.meters_per_tile,
+                )
+            dlg = self.manual_plan_dialog
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Manual Plan Error",
+                f"Manual plan dialog is not available:\n{exc}",
+            )
+            return
+        dlg.setWindowModality(Qt.NonModal)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def on_rectangle_committed(self, rect_cells: Tuple[int, int, int, int]) -> None:
         self.foundation_rect = rect_cells
