@@ -25,7 +25,9 @@ from pyproj import Transformer
 EARTH_RADIUS_M = 6371008.8
 
 
-def enu_to_wgs84_small_angle(ref_lat_deg: float, ref_lon_deg: float, east_m: float, north_m: float) -> Tuple[float, float]:
+def enu_to_wgs84_small_angle(
+    ref_lat_deg: float, ref_lon_deg: float, east_m: float, north_m: float
+) -> Tuple[float, float]:
     lat0_rad = math.radians(ref_lat_deg)
     dlat_deg = (north_m / EARTH_RADIUS_M) * (180.0 / math.pi)
     dlon_deg = (east_m / (EARTH_RADIUS_M * math.cos(lat0_rad))) * (180.0 / math.pi)
@@ -135,5 +137,3 @@ def fetch_swissimage_by_bbox_wgs84(
         data = resp.read()
     img = Image.open(io.BytesIO(data)).convert("RGBA")
     return img
-
-
