@@ -1,4 +1,4 @@
-## TerraMapMaker GUI (prototype)
+## 🗺️ TerraMapMaker GUI
 
 Simple 2D/3D PyQt5 GUI to load excavation-map `GridMap` artifacts, paint on a grid, and plan waypoints.
 
